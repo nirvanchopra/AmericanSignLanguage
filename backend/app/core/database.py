@@ -4,10 +4,20 @@ from app.core.config import settings
 from typing import AsyncGenerator
 
 # Configure async engine
-connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
+db_url = settings.DATABASE_URL
+connect_args = {}
+
+if "sqlite" in db_url:
+    connect_args["check_same_thread"] = False
+elif "postgresql" in db_url:
+    if db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if "sslmode=" in db_url or "channel_binding=" in db_url or "neon.tech" in db_url:
+        db_url = db_url.split("?")[0]
+        connect_args["ssl"] = "require"
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    db_url,
     echo=False,
     future=True,
     connect_args=connect_args

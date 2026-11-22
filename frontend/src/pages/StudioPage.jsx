@@ -48,8 +48,17 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
 
   // Connect WebSocket
   useEffect(() => {
+    let wsHost = window.location.host;
+    if (import.meta.env.VITE_BACKEND_URL) {
+      try {
+        const parsedUrl = new URL(import.meta.env.VITE_BACKEND_URL);
+        wsHost = parsedUrl.host;
+      } catch (e) {
+        wsHost = import.meta.env.VITE_BACKEND_URL.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      }
+    }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/recognize`;
+    const wsUrl = `${protocol}//${wsHost}/ws/recognize`;
     
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;

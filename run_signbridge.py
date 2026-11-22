@@ -13,8 +13,9 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = ROOT_DIR / "backend"
 FRONTEND_DIR = ROOT_DIR / "frontend"
-VENV_PYTHON = ROOT_DIR / ".v" / "Scripts" / "python.exe"
-
+VENV_PYTHON = ROOT_DIR / ".venv" / "Scripts" / "python.exe"
+if not VENV_PYTHON.exists():
+    VENV_PYTHON = ROOT_DIR / ".v" / "Scripts" / "python.exe"
 if not VENV_PYTHON.exists():
     VENV_PYTHON = Path(sys.executable)
 
@@ -44,6 +45,7 @@ def main():
     print("[1/3] Checking and initializing database...")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(BACKEND_DIR)
+    env["PYDANTIC_DISABLE_PLUGINS"] = "1"
     try:
         subprocess.run(
             [str(VENV_PYTHON), "-m", "app.db.init_db"],

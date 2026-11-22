@@ -123,6 +123,9 @@ async def seed_data():
         await session.commit()
         print("Database seeding completed.")
 
+async def main():
+    await init_models()
+    await seed_data()
+
 if __name__ == "__main__":
-    asyncio.run(init_models())
-    asyncio.run(seed_data())
+    asyncio.run(main())
