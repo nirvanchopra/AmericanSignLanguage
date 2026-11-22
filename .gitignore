@@ -1,0 +1,40 @@
+# Python & Virtual Environments
+.v/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Database & SQLite
+*.db
+*.sqlite3
+backend/signbridge.db
+
+# Node & Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large raw dataset folders (optional / if not needed in repo)
+# AtoZ_3.1 can be included if desired, but exclude temp cache
+*.mp4
+*.avi

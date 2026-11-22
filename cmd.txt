@@ -1,0 +1,2 @@
+..\..\.v\Scripts\Activate.ps1
+python .\final_pred.py
