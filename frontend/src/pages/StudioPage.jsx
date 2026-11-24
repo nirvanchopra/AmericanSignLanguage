@@ -19,6 +19,8 @@ import {
 
 export default function StudioPage({ selectedModel, setSelectedModel, showToast }) {
   const [isRecognizing, setIsRecognizing] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [serverStatus, setServerStatus] = useState('connecting'); // 'online' | 'waking' | 'offline'
   const [cameraError, setCameraError] = useState(null);
   const [currentPrediction, setCurrentPrediction] = useState({
     label: 'NONE',
@@ -46,110 +48,184 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
     isRecognizingRef.current = isRecognizing;
   }, [isRecognizing]);
 
-  // Connect WebSocket
+  // Pre-warm MediaPipe in background on page mount for instant startup
+  useEffect(() => {
+    let isMounted = true;
+    const prewarm = async () => {
+      let attempts = 0;
+      while ((!window.Hands || !window.Camera) && attempts < 50) {
+        await new Promise(r => setTimeout(r, 100));
+        attempts++;
+      }
+      if (window.Hands && !handsInstanceRef.current && isMounted) {
+        try {
+          const hands = new window.Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+          });
+          hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 0, // 0 = Lite model (3x faster download, instant startup, 60 FPS)
+            minDetectionConfidence: 0.55,
+            minTrackingConfidence: 0.55
+          });
+          hands.onResults(onHandResults);
+          handsInstanceRef.current = hands;
+          console.log('[Studio] MediaPipe Lite engine pre-warmed & ready.');
+        } catch (e) {
+          console.warn('Pre-warm error:', e);
+        }
+      }
+    };
+    prewarm();
+    return () => { isMounted = false; };
+  }, []);
+
+  // Connect WebSocket & Warm up Cloud Server
   useEffect(() => {
     let wsHost = window.location.host;
+    let backendHttpUrl = '';
     if (import.meta.env.VITE_BACKEND_URL) {
       try {
         const parsedUrl = new URL(import.meta.env.VITE_BACKEND_URL);
         wsHost = parsedUrl.host;
+        backendHttpUrl = import.meta.env.VITE_BACKEND_URL;
       } catch (e) {
         wsHost = import.meta.env.VITE_BACKEND_URL.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        backendHttpUrl = `https://${wsHost}`;
       }
+    } else {
+      backendHttpUrl = `${window.location.protocol}//${wsHost}`;
     }
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${wsHost}/ws/recognize`;
-    
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
 
-    ws.onopen = () => {
-      console.log('[Studio] WebSocket connected to SignBridge backend.');
-      ws.send(JSON.stringify({ type: 'init' }));
-    };
+    // Ping backend /health immediately to wake up sleeping Render instance
+    if (backendHttpUrl) {
+      fetch(`${backendHttpUrl}/health`)
+        .then(res => {
+          if (res.ok) setServerStatus('online');
+        })
+        .catch(() => {
+          setServerStatus('waking');
+        });
+    }
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'prediction') {
-          setCurrentPrediction({
-            label: data.label,
-            stabilized_label: data.stabilized_label,
-            confidence: data.confidence,
-            is_unknown: data.is_unknown,
-            top3: data.top3 || [],
-            latency_ms: data.latency_ms
-          });
-        } else if (data.type === 'new_token') {
-          setSentence(data.sentence || '');
-          setCurrentWord(data.current_word || '');
-          setSuggestions(data.suggestions || []);
-        } else if (data.type === 'dynamic_word') {
-          setSentence(data.sentence || '');
-          setCurrentWord(data.current_word || '');
-          setSuggestions(data.suggestions || []);
-          showToast(`Dynamic Sign Recognized: ${data.word}!`, 'success');
-          // Speak dynamic word if speech enabled
-          speakText(data.word);
-        } else if (data.type === 'sentence_update') {
-          setSentence(data.sentence || '');
-          setCurrentWord(data.current_word || '');
-          setSuggestions(data.suggestions || []);
+    let reconnectTimer = null;
+    let isComponentMounted = true;
+
+    const connectWs = () => {
+      if (!isComponentMounted) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${wsHost}/ws/recognize`;
+      
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('[Studio] WebSocket connected to SignBridge backend.');
+        setServerStatus('online');
+        ws.send(JSON.stringify({ type: 'init' }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'prediction') {
+            setCurrentPrediction({
+              label: data.label,
+              stabilized_label: data.stabilized_label,
+              confidence: data.confidence,
+              is_unknown: data.is_unknown,
+              top3: data.top3 || [],
+              latency_ms: data.latency_ms
+            });
+          } else if (data.type === 'new_token') {
+            setSentence(data.sentence || '');
+            setCurrentWord(data.current_word || '');
+            setSuggestions(data.suggestions || []);
+          } else if (data.type === 'dynamic_word') {
+            setSentence(data.sentence || '');
+            setCurrentWord(data.current_word || '');
+            setSuggestions(data.suggestions || []);
+            showToast(`Dynamic Sign Recognized: ${data.word}!`, 'success');
+            speakText(data.word);
+          } else if (data.type === 'sentence_update') {
+            setSentence(data.sentence || '');
+            setCurrentWord(data.current_word || '');
+            setSuggestions(data.suggestions || []);
+          }
+        } catch (err) {
+          console.error('WS parse error:', err);
         }
-      } catch (err) {
-        console.error('WS parse error:', err);
-      }
+      };
+
+      ws.onerror = (err) => {
+        console.warn('WS error (server waking up or offline):', err);
+        setServerStatus('waking');
+      };
+
+      ws.onclose = () => {
+        if (!isComponentMounted) return;
+        setServerStatus('waking');
+        if (!reconnectTimer) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            connectWs();
+          }, 3500);
+        }
+      };
     };
 
-    ws.onerror = (err) => {
-      console.warn('WS error (running in fallback REST mode):', err);
-    };
+    connectWs();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
+      isComponentMounted = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.close();
       }
     };
   }, []);
 
-  // Initialize MediaPipe Hands
+  // Initialize MediaPipe Hands & Camera with fast Lite model
   const initMediaPipe = async () => {
-    if (!window.Hands || !window.Camera) {
-      console.warn('MediaPipe library loading via CDN...');
-      return;
+    // Wait up to 5s if CDN is still loading
+    let attempts = 0;
+    while ((!window.Hands || !window.Camera) && attempts < 50) {
+      await new Promise(r => setTimeout(r, 100));
+      attempts++;
     }
 
-    try {
+    if (!window.Hands || !window.Camera) {
+      throw new Error('MediaPipe libraries took too long to load from CDN. Please check your internet connection.');
+    }
+
+    if (!handsInstanceRef.current) {
       const hands = new window.Hands({
         locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
       });
 
       hands.setOptions({
         maxNumHands: 1,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.6,
-        minTrackingConfidence: 0.6
+        modelComplexity: 0, // Lite model for instant start & 60 FPS
+        minDetectionConfidence: 0.55,
+        minTrackingConfidence: 0.55
       });
 
       hands.onResults(onHandResults);
       handsInstanceRef.current = hands;
+    }
 
-      if (videoRef.current) {
-        const camera = new window.Camera(videoRef.current, {
-          onFrame: async () => {
-            if (isRecognizingRef.current && videoRef.current && handsInstanceRef.current) {
-              await handsInstanceRef.current.send({ image: videoRef.current });
-            }
-          },
-          width: 640,
-          height: 480
-        });
-        camera.start();
-        cameraInstanceRef.current = camera;
-      }
-    } catch (err) {
-      console.error('Failed to initialize webcam / MediaPipe:', err);
-      setCameraError('Camera access required. Please allow webcam permissions in your browser.');
+    if (!cameraInstanceRef.current && videoRef.current) {
+      const camera = new window.Camera(videoRef.current, {
+        onFrame: async () => {
+          if (isRecognizingRef.current && videoRef.current && handsInstanceRef.current) {
+            await handsInstanceRef.current.send({ image: videoRef.current });
+          }
+        },
+        width: 640,
+        height: 480
+      });
+      await camera.start();
+      cameraInstanceRef.current = camera;
     }
   };
 
@@ -224,12 +300,19 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
 
   const handleStartStop = async () => {
     if (!isRecognizing) {
+      setIsStarting(true);
       setCameraError(null);
-      if (!cameraInstanceRef.current) {
+      try {
         await initMediaPipe();
+        setIsRecognizing(true);
+        showToast('Live Recognition Studio Started', 'success');
+      } catch (err) {
+        console.error('Failed to initialize webcam / MediaPipe:', err);
+        setCameraError(err.message || 'Camera access required. Please allow webcam permissions in your browser.');
+        showToast(err.message || 'Failed to start camera', 'error');
+      } finally {
+        setIsStarting(false);
       }
-      setIsRecognizing(true);
-      showToast('Live Recognition Studio Started', 'success');
     } else {
       setIsRecognizing(false);
       showToast('Recognition Paused', 'info');
@@ -297,6 +380,25 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
               <span>{isRecognizing ? 'STREAMING ACTIVE' : 'STANDBY'}</span>
             </span>
+
+            {/* Cloud Server Status Indicator */}
+            {serverStatus === 'online' && (
+              <span className="hidden sm:flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" title="Render AI server is online and responding with ultra-low latency.">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                <span>AI Cloud Ready</span>
+              </span>
+            )}
+            {serverStatus === 'waking' && (
+              <span className="flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse" title="Render free tier services spin down after 15m of inactivity. Server is waking up...">
+                <RefreshCw className="w-3 h-3 text-amber-400 animate-spin" />
+                <span>Waking Up AI Cloud...</span>
+              </span>
+            )}
+            {serverStatus === 'connecting' && (
+              <span className="hidden sm:flex items-center space-x-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-slate-800/80 text-slate-400 border border-slate-700/60">
+                <span>Connecting...</span>
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-400 mt-1">
             Real-time hand tracking, kinematic classification, and speech translation pipeline.
@@ -306,14 +408,31 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
         <div className="flex items-center space-x-3">
           <button
             onClick={handleStartStop}
+            disabled={isStarting}
             className={`flex items-center space-x-2 px-5 py-2.5 rounded-xl font-semibold text-xs shadow-lg transition-all ${
-              isRecognizing 
-                ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/25' 
-                : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/25'
+              isStarting
+                ? 'bg-indigo-700/70 text-indigo-200 cursor-wait'
+                : isRecognizing 
+                  ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/25' 
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/25'
             }`}
           >
-            {isRecognizing ? <Square className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-            <span>{isRecognizing ? 'Stop Stream' : 'Start Recognition'}</span>
+            {isStarting ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                <span>Starting Camera...</span>
+              </>
+            ) : isRecognizing ? (
+              <>
+                <Square className="w-4 h-4" />
+                <span>Stop Stream</span>
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" />
+                <span>Start Recognition</span>
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -344,17 +463,22 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
             {!isRecognizing && (
               <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center text-center p-6">
                 <div className="w-16 h-16 rounded-2xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 mb-4">
-                  <Video className="w-8 h-8" />
+                  {isStarting ? <RefreshCw className="w-8 h-8 animate-spin text-indigo-400" /> : <Video className="w-8 h-8" />}
                 </div>
-                <h3 className="text-lg font-bold text-white">Camera Standby</h3>
+                <h3 className="text-lg font-bold text-white">
+                  {isStarting ? 'Starting Camera & AI Engine...' : 'Camera Standby'}
+                </h3>
                 <p className="text-xs text-slate-400 max-w-sm mt-1 mb-6">
-                  Click 'Start Recognition' to initialize the camera feed and begin real-time landmark tracking.
+                  {isStarting 
+                    ? 'Initializing MediaPipe 3D hand tracker and requesting webcam stream...' 
+                    : "Click 'Start Recognition' to initialize the camera feed and begin real-time landmark tracking."}
                 </p>
                 <button
                   onClick={handleStartStop}
-                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-500/25 transition"
+                  disabled={isStarting}
+                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-lg shadow-indigo-500/25 transition disabled:opacity-50"
                 >
-                  Start Camera Feed
+                  {isStarting ? 'Loading...' : 'Start Camera Feed'}
                 </button>
               </div>
             )}

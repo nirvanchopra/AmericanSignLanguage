@@ -56,6 +56,20 @@ async def health_check():
         "timestamp": time.time()
     }
 
+@app.on_event("startup")
+async def on_startup():
+    import asyncio
+    asyncio.create_task(init_db_in_background())
+
+async def init_db_in_background():
+    try:
+        from app.db.init_db import init_models, seed_data
+        await init_models()
+        await seed_data()
+        logger.info("Database background initialization & seeding complete.")
+    except Exception as e:
+        logger.warning(f"Background database setup notice: {e}")
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Global exception on {request.url.path}: {exc}", exc_info=True)
