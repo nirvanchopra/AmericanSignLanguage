@@ -80,11 +80,24 @@ async def websocket_recognition_endpoint(websocket: WebSocket):
                         session_tokens.append(dyn_word)
                         # Re-calculate sentence
                         trans = translation_service.assemble_sentence(session_tokens)
+                        if current_session_id:
+                            async with AsyncSessionLocal() as db:
+                                repo = SessionRepository(db)
+                                await repo.add_prediction(
+                                    session_id=current_session_id,
+                                    predicted_label=dyn_word,
+                                    confidence=pred_res.get("dynamic_confidence", 0.9),
+                                    top3=pred_res.get("top3", []),
+                                    latency_ms=pred_res.get("latency_ms", 0.0)
+                                )
+
                         await manager.send_json(websocket, {
                             "type": "dynamic_word",
                             "word": dyn_word,
                             "confidence": pred_res.get("dynamic_confidence", 0.9),
                             "sentence": trans["sentence"],
+                            "current_word": trans["current_word"],
+                            "suggestions": trans["suggestions"],
                             "tts_text": trans["tts_text"],
                             "latency_ms": pred_res["latency_ms"]
                         })

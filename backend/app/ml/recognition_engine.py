@@ -9,19 +9,22 @@ from app.core.config import settings
 class RecognitionEngine:
     """
     Unified ML recognition facade providing:
-    1. Modern LandmarkNet (Static Alphabet & Hand Gestures)
-    2. Dynamic Sequence BiLSTM (Conversational Dynamic Signs)
+    1. Modern LandmarkNet (Static Alphabet & Hand Gestures & Word Signs)
+    2. Dynamic Sequence Engine (Conversational Dynamic Signs: HELLO, HI, YES, NO, etc.)
     3. Legacy Keras CNN Adapter (Backward Compatibility)
     4. Temporal Hysteresis & Prediction Smoothing
     """
     def __init__(self):
         self.normalizer = LandmarkNormalizer()
-        self.landmark_classifier = LandmarkClassifier(confidence_threshold=settings.CONFIDENCE_THRESHOLD)
-        self.dynamic_recognizer = DynamicSequenceRecognizer(sequence_length=settings.SEQUENCE_BUFFER_LENGTH)
+        self.landmark_classifier = LandmarkClassifier(confidence_threshold=0.55)
+        self.dynamic_recognizer = DynamicSequenceRecognizer(
+            sequence_length=settings.SEQUENCE_BUFFER_LENGTH,
+            confidence_threshold=0.65
+        )
         self.legacy_adapter = LegacyKerasAdapter(model_path=settings.LEGACY_MODEL_PATH)
         self.smoother = TemporalGestureSmoother(
             window_size=settings.SMOOTHING_WINDOW,
-            confidence_threshold=settings.CONFIDENCE_THRESHOLD
+            confidence_threshold=0.55
         )
 
     def process_frame(
@@ -33,28 +36,35 @@ class RecognitionEngine:
         bbox: Optional[Dict[str, int]] = None
     ) -> Dict[str, Any]:
         """
-        Coordinates normalization, model inference, and temporal stabilization.
+        Coordinates normalization, model inference, dynamic sequence tracking, and temporal stabilization.
         """
         if not landmarks or len(landmarks) != 21:
             return {
                 "label": "NONE",
                 "stabilized_label": "NONE",
+                "active_stable_label": None,
                 "confidence": 0.0,
                 "is_unknown": True,
                 "is_new_token": False,
                 "dynamic_word": None,
+                "dynamic_confidence": 0.0,
                 "top3": [],
                 "latency_ms": 0.0,
+                "stability_ratio": 0.0,
                 "model_used": model_preference
             }
 
-        # 1. Normalize landmarks
+        # 1. Normalize landmarks & extract kinematic geometric features
         norm_vector = self.normalizer.normalize_landmarks(landmarks, handedness=handedness)
         geom_features = self.normalizer.extract_geometric_features(landmarks)
 
-        # 2. Add to dynamic sequence buffer
-        self.dynamic_recognizer.add_frame(norm_vector)
-        dynamic_result = self.dynamic_recognizer.predict()
+        # 2. Add frame to dynamic sequence buffer with raw landmarks for screen-space trajectory tracking
+        self.dynamic_recognizer.add_frame(
+            normalized_landmarks=norm_vector,
+            raw_landmarks=landmarks,
+            geometric_features=geom_features
+        )
+        dynamic_result = self.dynamic_recognizer.predict(geometric_features=geom_features)
 
         # 3. Model Inference based on preference
         if model_preference == "legacy" and raw_pixel_points and len(raw_pixel_points) == 21:
@@ -62,7 +72,7 @@ class RecognitionEngine:
             h = bbox.get("h", 200) if bbox else 200
             pred = self.legacy_adapter.predict(raw_pixel_points, w, h)
         else:
-            # Modern LandmarkNet
+            # Modern kinematic LandmarkNet
             pred = self.landmark_classifier.predict(norm_vector, geom_features)
 
         # 4. Temporal Smoothing & Hysteresis

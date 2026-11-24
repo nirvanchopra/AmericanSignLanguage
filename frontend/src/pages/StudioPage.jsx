@@ -86,6 +86,8 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
           setSuggestions(data.suggestions || []);
         } else if (data.type === 'dynamic_word') {
           setSentence(data.sentence || '');
+          setCurrentWord(data.current_word || '');
+          setSuggestions(data.suggestions || []);
           showToast(`Dynamic Sign Recognized: ${data.word}!`, 'success');
           // Speak dynamic word if speech enabled
           speakText(data.word);

@@ -5,15 +5,16 @@ import numpy as np
 class TemporalGestureSmoother:
     """
     Prevents prediction flickering and performs temporal gesture segmentation:
-    - Sliding window majority voting and exponential probability smoothing.
-    - Hysteresis: requires a sign to be stable for min_consecutive_frames before triggering a state change.
-    - Gesture hold detection: detects when the user holds a sign steady vs transit.
+    - Sliding window majority voting and probability smoothing.
+    - Hysteresis: requires a sign to be held stable for min_consecutive_frames before triggering state change.
+    - Double letter support: when a hand drops/relaxes to UNKNOWN for a few frames, resets state so repeating
+      letters (like LL in HELLO, ALL; OO in GOOD; EE in SEE) can be signed smoothly.
     - Unknown gesture rejection if confidence is below threshold.
     """
     def __init__(
         self,
         window_size: int = 5,
-        confidence_threshold: float = 0.65,
+        confidence_threshold: float = 0.55,
         min_consecutive_frames: int = 4
     ):
         self.window_size = window_size
@@ -35,7 +36,7 @@ class TemporalGestureSmoother:
         top3: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
-        Processes a raw frame prediction and applies smoothing and hysteresis.
+        Processes a raw frame prediction, applies smoothing and hysteresis.
         Returns stabilized result dictionary.
         """
         self.total_frames_processed += 1
@@ -53,12 +54,17 @@ class TemporalGestureSmoother:
             self.candidate_label = effective_label
             self.candidate_count = 1
 
-        # If candidate has been held for minimum required consecutive frames, confirm transition
+        # Check stable confirmation
         new_stable_event = False
         if self.candidate_count >= self.min_consecutive_frames:
-            if self.candidate_label != self.last_stable_label and self.candidate_label != "UNKNOWN":
-                self.last_stable_label = self.candidate_label
-                new_stable_event = True
+            if self.candidate_label != "UNKNOWN":
+                if self.candidate_label != self.last_stable_label:
+                    self.last_stable_label = self.candidate_label
+                    new_stable_event = True
+            else:
+                # Hand relaxed / transitioned through UNKNOWN for consecutive frames
+                # Reset last_stable_label to allow re-signing the same letter (e.g. LL in HELLO, ALL)
+                self.last_stable_label = None
 
         # Majority vote in window
         labels_in_window = list(self.prediction_history)

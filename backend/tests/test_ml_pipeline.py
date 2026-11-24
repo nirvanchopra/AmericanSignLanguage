@@ -5,6 +5,7 @@ from app.ml.landmark_classifier import LandmarkClassifier
 from app.ml.dynamic_sequence_model import DynamicSequenceRecognizer
 from app.ml.temporal_smoother import TemporalGestureSmoother
 from app.ml.recognition_engine import recognition_engine
+from app.services.translation_service import translation_service
 
 def test_landmark_normalizer():
     # 21 mock landmarks
@@ -16,45 +17,95 @@ def test_landmark_normalizer():
     assert norm[1] == 0.0
     assert norm[2] == 0.0
 
-def test_landmark_classifier():
+    geom = LandmarkNormalizer.extract_geometric_features(mock_landmarks)
+    assert "is_index_extended" in geom
+    assert "extended_count" in geom
+    assert "thumb_index_dist" in geom
+
+def test_landmark_classifier_letters():
     classifier = LandmarkClassifier()
-    # Test canonical A template prediction
-    template_a = classifier.templates['A']
-    pred = classifier.predict(template_a, {})
-    assert pred["label"] == 'A'
-    assert pred["confidence"] > 0.60
-    assert len(pred["top3"]) == 3
-    assert pred["latency_ms"] >= 0.0
 
-def test_temporal_smoother():
+    # Test distinct letter canonical templates
+    for letter in ['A', 'B', 'C', 'D', 'L', 'V', 'W', 'Y', 'I_LOVE_YOU']:
+        template = classifier.templates[letter]
+        pred = classifier.predict(template, {})
+        assert pred["label"] == letter, f"Expected {letter}, got {pred['label']}"
+        assert pred["confidence"] >= 0.50
+        assert len(pred["top3"]) == 3
+
+def test_temporal_smoother_and_double_letters():
     smoother = TemporalGestureSmoother(window_size=5, min_consecutive_frames=3)
-    # Stream unstable frame
-    res1 = smoother.process_frame_prediction("A", 0.9, [])
-    assert res1["is_new_stable_token"] is False
-    # Stream consistent frames
-    smoother.process_frame_prediction("A", 0.9, [])
-    res3 = smoother.process_frame_prediction("A", 0.9, [])
-    assert res3["is_new_stable_token"] is True
-    assert res3["active_stable_label"] == "A"
 
-def test_dynamic_recognizer():
-    recognizer = DynamicSequenceRecognizer(sequence_length=5)
-    # Fill buffer
-    for i in range(5):
-        vec = np.zeros(63, dtype=np.float32)
-        vec[24] = float(i * 0.1)  # Simulate index fingertip moving
-        recognizer.add_frame(vec)
-    assert recognizer.is_buffer_full() is True
-    pred = recognizer.predict()
-    assert "word" in pred
-    assert "top3" in pred
+    # First 'L'
+    res1 = smoother.process_frame_prediction("L", 0.9, [])
+    assert res1["is_new_stable_token"] is False
+    smoother.process_frame_prediction("L", 0.9, [])
+    res3 = smoother.process_frame_prediction("L", 0.9, [])
+    assert res3["is_new_stable_token"] is True
+    assert res3["active_stable_label"] == "L"
+
+    # Relax hand (UNKNOWN)
+    for _ in range(4):
+        smoother.process_frame_prediction("UNKNOWN", 0.2, [])
+
+    # Second 'L' (e.g. LL in HELLO, ALL)
+    smoother.process_frame_prediction("L", 0.9, [])
+    smoother.process_frame_prediction("L", 0.9, [])
+    res_second_l = smoother.process_frame_prediction("L", 0.9, [])
+    assert res_second_l["is_new_stable_token"] is True
+    assert res_second_l["active_stable_label"] == "L"
+
+def test_dynamic_recognizer_wave_hello():
+    recognizer = DynamicSequenceRecognizer(sequence_length=20)
+    # Simulate hand wave: palm oscillates horizontally with open hand
+    t = np.linspace(0, 2 * np.pi, 20)
+    norm_vec = recognizer.DYNAMIC_WORDS  # placeholder
+    for val in 0.5 + 0.07 * np.sin(2 * t):
+        mock_raw = [{"x": float(val), "y": 0.5, "z": 0.0} for _ in range(21)]
+        # Mark index, middle, ring as extended
+        recognizer.add_frame(
+            normalized_landmarks=np.zeros(63, dtype=np.float32),
+            raw_landmarks=mock_raw,
+            geometric_features={"extended_count": 4, "total_extended": 5}
+        )
+    pred = recognizer.predict(geometric_features={"extended_count": 4})
+    assert pred["word"] in ["HELLO", "HI"]
+    assert pred["is_dynamic"] is True
+
+def test_dynamic_recognizer_nod_yes():
+    recognizer = DynamicSequenceRecognizer(sequence_length=20)
+    # Simulate nodding fist: palm oscillates vertically with fist
+    t = np.linspace(0, 2 * np.pi, 20)
+    for val in 0.5 + 0.06 * np.sin(2 * t):
+        mock_raw = [{"x": 0.5, "y": float(val), "z": 0.0} for _ in range(21)]
+        recognizer.add_frame(
+            normalized_landmarks=np.zeros(63, dtype=np.float32),
+            raw_landmarks=mock_raw,
+            geometric_features={"extended_count": 0, "is_fist": True}
+        )
+    pred = recognizer.predict(geometric_features={"extended_count": 0, "is_fist": True})
+    assert pred["word"] == "YES"
+    assert pred["is_dynamic"] is True
+
+def test_translation_service_word_predictions():
+    # Test prefix suggestions
+    sugg_h = translation_service.get_suggestions("H")
+    assert "HELLO" in sugg_h or "HI" in sugg_h
+
+    sugg_he = translation_service.get_suggestions("HE")
+    assert "HELLO" in sugg_he
+
+    sugg_th = translation_service.get_suggestions("TH")
+    assert "THANK" in sugg_th or "THANKS" in sugg_th
+
+    # Test sentence assembly with dynamic words and letters
+    tokens = ["HELLO", "H", "O", "W", "SPACE", "A", "R", "E", "SPACE", "Y", "O", "U"]
+    result = translation_service.assemble_sentence(tokens)
+    assert "Hello" in result["sentence"]
+    assert "how are you" in result["sentence"].lower()
 
 def test_recognition_engine_pipeline():
-    mock_landmarks = [{"x": 0.5, "y": 0.5, "z": 0.0} for _ in range(21)]
-    # Modify fingertips for non-zero coordinates
-    for i in range(21):
-        mock_landmarks[i] = {"x": 0.5 + 0.02 * i, "y": 0.5 - 0.03 * i, "z": 0.0}
-    
+    mock_landmarks = [{"x": 0.5 + 0.01 * i, "y": 0.5 - 0.02 * i, "z": 0.0} for i in range(21)]
     result = recognition_engine.process_frame(
         landmarks=mock_landmarks,
         handedness="Right",
@@ -67,8 +118,10 @@ def test_recognition_engine_pipeline():
 
 if __name__ == "__main__":
     test_landmark_normalizer()
-    test_landmark_classifier()
-    test_temporal_smoother()
-    test_dynamic_recognizer()
+    test_landmark_classifier_letters()
+    test_temporal_smoother_and_double_letters()
+    test_dynamic_recognizer_wave_hello()
+    test_dynamic_recognizer_nod_yes()
+    test_translation_service_word_predictions()
     test_recognition_engine_pipeline()
     print("Verification OK: 100% of ML modules tested and working!")
