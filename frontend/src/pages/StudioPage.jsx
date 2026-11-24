@@ -14,8 +14,17 @@ import {
   AlertTriangle,
   Play,
   Square,
-  RefreshCw
+  RefreshCw,
+  Zap
 } from 'lucide-react';
+import {
+  normalizeLandmarks,
+  extractGeometricFeatures,
+  classifySign,
+  ClientDynamicTracker,
+  ClientTemporalSmoother,
+  formatSentence
+} from '../utils/signClassifier';
 
 export default function StudioPage({ selectedModel, setSelectedModel, showToast }) {
   const [isRecognizing, setIsRecognizing] = useState(false);
@@ -43,6 +52,9 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
   const handsInstanceRef = useRef(null);
   const lastFrameTimeRef = useRef(performance.now());
   const isRecognizingRef = useRef(false);
+  const localSmootherRef = useRef(new ClientTemporalSmoother(5, 4));
+  const localDynamicRef = useRef(new ClientDynamicTracker(20));
+  const localTokensRef = useRef([]);
 
   useEffect(() => {
     isRecognizingRef.current = isRecognizing;
@@ -128,29 +140,27 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.type === 'prediction') {
-            setCurrentPrediction({
-              label: data.label,
-              stabilized_label: data.stabilized_label,
-              confidence: data.confidence,
-              is_unknown: data.is_unknown,
-              top3: data.top3 || [],
-              latency_ms: data.latency_ms
-            });
-          } else if (data.type === 'new_token') {
-            setSentence(data.sentence || '');
-            setCurrentWord(data.current_word || '');
-            setSuggestions(data.suggestions || []);
-          } else if (data.type === 'dynamic_word') {
-            setSentence(data.sentence || '');
-            setCurrentWord(data.current_word || '');
-            setSuggestions(data.suggestions || []);
-            showToast(`Dynamic Sign Recognized: ${data.word}!`, 'success');
-            speakText(data.word);
-          } else if (data.type === 'sentence_update') {
-            setSentence(data.sentence || '');
-            setCurrentWord(data.current_word || '');
-            setSuggestions(data.suggestions || []);
+          // When legacy server model is explicitly selected, let server drive UI.
+          // For landmarknet and dynamic models, the client runs at 60 FPS with 0ms latency.
+          if (selectedModel === 'legacy') {
+            if (data.type === 'prediction') {
+              setCurrentPrediction({
+                label: data.label,
+                stabilized_label: data.stabilized_label,
+                confidence: data.confidence,
+                is_unknown: data.is_unknown,
+                top3: data.top3 || [],
+                latency_ms: data.latency_ms
+              });
+            } else if (data.type === 'new_token' || data.type === 'dynamic_word' || data.type === 'sentence_update') {
+              setSentence(data.sentence || '');
+              setCurrentWord(data.current_word || '');
+              setSuggestions(data.suggestions || []);
+              if (data.type === 'dynamic_word') {
+                showToast(`Dynamic Sign Recognized: ${data.word}!`, 'success');
+                speakText(data.word);
+              }
+            }
           }
         } catch (err) {
           console.error('WS parse error:', err);
@@ -229,7 +239,7 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
     }
   };
 
-  // Draw hand skeleton & stream landmarks
+  // Draw hand skeleton & run 60 FPS instant local classification
   const onHandResults = (results) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -285,7 +295,66 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
         ctx.fill();
       });
 
-      // Send to WebSocket
+      // Instant Local Kinematic Inference (0ms latency, runs at 60 FPS)
+      if (selectedModel !== 'legacy') {
+        const normVector = normalizeLandmarks(landmarks, handedness);
+        const geom = extractGeometricFeatures(landmarks);
+
+        // Check dynamic gesture trajectory (waving HELLO/HI, nodding YES, snapping NO, PLEASE, THANK YOU, HELP)
+        const dynamicEvent = localDynamicRef.current.addFrame(landmarks, geom);
+        const inferenceLatency = performance.now() - now;
+
+        if (dynamicEvent) {
+          const word = dynamicEvent.word;
+          localTokensRef.current.push(word);
+          localTokensRef.current.push(' ');
+          const formatted = formatSentence(localTokensRef.current);
+          
+          setSentence(formatted.sentence);
+          setCurrentWord(formatted.currentWord);
+          setSuggestions(formatted.suggestions);
+          
+          setCurrentPrediction({
+            label: word,
+            stabilized_label: word,
+            confidence: dynamicEvent.confidence,
+            is_unknown: false,
+            top3: [{ label: word, confidence: dynamicEvent.confidence }],
+            latency_ms: inferenceLatency
+          });
+
+          showToast(`Dynamic Sign Recognized: ${word}!`, 'success');
+          speakText(word);
+        } else {
+          // Static alphabet sign classification
+          const pred = classifySign(normVector, geom);
+          const { stabilizedLabel, isNewToken } = localSmootherRef.current.process(pred.label, pred.confidence);
+
+          setCurrentPrediction({
+            label: pred.label,
+            stabilized_label: stabilizedLabel,
+            confidence: pred.confidence,
+            is_unknown: pred.is_unknown,
+            top3: pred.top3 || [],
+            latency_ms: inferenceLatency
+          });
+
+          if (isNewToken && stabilizedLabel && stabilizedLabel !== 'UNKNOWN') {
+            localTokensRef.current.push(stabilizedLabel);
+            const formatted = formatSentence(localTokensRef.current);
+            
+            setSentence(formatted.sentence);
+            setCurrentWord(formatted.currentWord);
+            setSuggestions(formatted.suggestions);
+
+            if (stabilizedLabel.length > 1 && stabilizedLabel !== 'SPACE' && stabilizedLabel !== 'DEL') {
+              speakText(stabilizedLabel);
+            }
+          }
+        }
+      }
+
+      // Forward to WebSocket if connected (for server-side DB recording & sync)
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isRecognizingRef.current) {
         wsRef.current.send(JSON.stringify({
           type: 'frame',
@@ -294,6 +363,9 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
           model: selectedModel
         }));
       }
+    } else {
+      // Hand out of frame -> signal smoother so repeated signs (like L-L in ALL) trigger cleanly
+      localSmootherRef.current.process('UNKNOWN', 0.0);
     }
     ctx.restore();
   };
@@ -305,7 +377,7 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
       try {
         await initMediaPipe();
         setIsRecognizing(true);
-        showToast('Live Recognition Studio Started', 'success');
+        showToast('Live Recognition Studio Started (Instant 60 FPS)', 'success');
       } catch (err) {
         console.error('Failed to initialize webcam / MediaPipe:', err);
         setCameraError(err.message || 'Camera access required. Please allow webcam permissions in your browser.');
@@ -334,6 +406,9 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
   };
 
   const handleClear = () => {
+    localTokensRef.current = [];
+    localSmootherRef.current.reset();
+    localDynamicRef.current.reset();
     setSentence('');
     setCurrentWord('');
     setSuggestions([]);
@@ -344,7 +419,13 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
   };
 
   const handleUndo = () => {
-    if (sentence.length > 0) {
+    if (localTokensRef.current.length > 0) {
+      localTokensRef.current.pop();
+      const formatted = formatSentence(localTokensRef.current);
+      setSentence(formatted.sentence);
+      setCurrentWord(formatted.currentWord);
+      setSuggestions(formatted.suggestions);
+    } else if (sentence.length > 0) {
       const words = sentence.trim().split(' ');
       words.pop();
       setSentence(words.join(' '));
@@ -360,12 +441,24 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
   };
 
   const handleSelectSuggestion = (word) => {
+    // Replace partial current word tokens with chosen suggestion
+    while (localTokensRef.current.length > 0) {
+      const lastTok = localTokensRef.current[localTokensRef.current.length - 1];
+      if (lastTok.length === 1 && lastTok !== ' ' && lastTok !== 'SPACE') {
+        localTokensRef.current.pop();
+      } else {
+        break;
+      }
+    }
+    localTokensRef.current.push(word);
+    localTokensRef.current.push(' ');
+    const formatted = formatSentence(localTokensRef.current);
+    setSentence(formatted.sentence);
+    setCurrentWord(formatted.currentWord);
+    setSuggestions(formatted.suggestions);
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'commit_word', word }));
-    } else {
-      setSentence(prev => prev + ' ' + word);
-      setCurrentWord('');
-      setSuggestions([]);
     }
   };
 
@@ -507,16 +600,19 @@ export default function StudioPage({ selectedModel, setSelectedModel, showToast 
           {/* Model & Hand Controls */}
           <div className="glass-panel p-4 rounded-xl flex items-center justify-between text-xs">
             <div className="flex items-center space-x-2">
-              <Cpu className="w-4 h-4 text-indigo-400" />
+              <Cpu className="w-4 h-4 text-emerald-400" />
               <span className="text-slate-400">Inference Engine:</span>
-              <span className="font-semibold text-slate-200">
-                {selectedModel === 'landmarknet' && 'LandmarkNet v1 (Normalized 3D)'}
-                {selectedModel === 'dynamic' && 'Temporal BiLSTM (20-Frame Sequence)'}
-                {selectedModel === 'legacy' && 'Legacy Keras CNN (Preserved H5)'}
+              <span className="font-semibold text-emerald-400 flex items-center space-x-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span>
+                  {selectedModel === 'landmarknet' && 'Client LandmarkNet 3D (0ms Instant AI)'}
+                  {selectedModel === 'dynamic' && 'Dynamic Gesture Sequence Tracker (60 FPS)'}
+                  {selectedModel === 'legacy' && 'Cloud Keras CNN'}
+                </span>
               </span>
             </div>
             <div className="text-slate-400 font-mono text-[11px]">
-              21 Keypoints Extracted
+              21 Keypoints · 60 FPS
             </div>
           </div>
         </div>
